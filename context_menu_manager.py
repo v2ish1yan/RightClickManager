@@ -2,6 +2,7 @@ import re
 import sys
 import json
 import os
+import ctypes
 import threading
 from contextlib import suppress
 from dataclasses import dataclass
@@ -72,6 +73,20 @@ class ImportPlanItem:
     enabled: bool
     action: str  # create | update | unchanged | blocked | skip
     reason: str = ""
+
+
+@dataclass
+class TreeStateChange:
+    hive: int
+    path: str
+    before: object
+    after: object
+
+
+@dataclass
+class HistoryRecord:
+    label: str
+    changes: List[TreeStateChange]
 
 
 def build_scopes() -> List[Scope]:
@@ -180,6 +195,15 @@ class RegistryManager:
 
     def _uid(self, scope: Scope, key_name: str) -> str:
         return f"{scope.id}|{key_name}"
+
+    def uid_to_hive_path(self, uid: str) -> Tuple[int, str]:
+        scope_id, key_name = uid.split("|", 1)
+        scope = self.scope_map[scope_id]
+        return scope.hive, f"{scope.path}\\{key_name}"
+
+    def scope_key_to_hive_path(self, scope_id: str, key_name: str) -> Tuple[int, str]:
+        scope = self.scope_map[scope_id]
+        return scope.hive, f"{scope.path}\\{key_name}"
 
     def _extract_command(self, hive: int, item_path: str) -> Tuple[str, bool]:
         with suppress(OSError):
@@ -366,6 +390,59 @@ class RegistryManager:
             self._delete_tree(hive, f"{path}\\{child}")
         winreg.DeleteKey(hive, path)
 
+    def _delete_tree_if_exists(self, hive: int, path: str):
+        with suppress(OSError):
+            self._delete_tree(hive, path)
+
+    @staticmethod
+    def _export_tree_from_open_key(key) -> Dict:
+        values: List[Tuple[str, object, int]] = []
+        value_index = 0
+        while True:
+            try:
+                name, value, value_type = winreg.EnumValue(key, value_index)
+                values.append((name, value, value_type))
+                value_index += 1
+            except OSError:
+                break
+
+        children: Dict[str, Dict] = {}
+        child_index = 0
+        while True:
+            try:
+                child_name = winreg.EnumKey(key, child_index)
+                child_index += 1
+            except OSError:
+                break
+            with winreg.OpenKey(key, child_name, 0, winreg.KEY_READ) as child_key:
+                children[child_name] = RegistryManager._export_tree_from_open_key(child_key)
+
+        return {"values": values, "children": children}
+
+    def export_tree_if_exists(self, hive: int, path: str):
+        with suppress(OSError):
+            with winreg.OpenKey(hive, path, 0, winreg.KEY_READ) as key:
+                return self._export_tree_from_open_key(key)
+        return None
+
+    def export_uid_tree_if_exists(self, uid: str):
+        hive, path = self.uid_to_hive_path(uid)
+        return self.export_tree_if_exists(hive, path)
+
+    def _import_tree_to_open_key(self, key, tree: Dict):
+        for name, value, value_type in tree.get("values", []):
+            winreg.SetValueEx(key, name, 0, value_type, value)
+        for child_name, child_tree in tree.get("children", {}).items():
+            with winreg.CreateKeyEx(key, child_name, 0, winreg.KEY_SET_VALUE | winreg.KEY_CREATE_SUB_KEY) as child_key:
+                self._import_tree_to_open_key(child_key, child_tree)
+
+    def apply_tree_state(self, hive: int, path: str, tree_state):
+        self._delete_tree_if_exists(hive, path)
+        if tree_state is None:
+            return
+        with winreg.CreateKeyEx(hive, path, 0, winreg.KEY_SET_VALUE | winreg.KEY_CREATE_SUB_KEY) as root_key:
+            self._import_tree_to_open_key(root_key, tree_state)
+
     def can_write(self, item: MenuItem) -> bool:
         if item.kind != "shell":
             return False
@@ -508,9 +585,13 @@ class MainWindow(QMainWindow):
         self.refresh_inflight = False
         self.pending_refresh: Optional[Tuple[str, bool]] = None
         self.third_party_cache: Dict[str, bool] = {}
+        self.undo_stack: List[HistoryRecord] = []
+        self.redo_stack: List[HistoryRecord] = []
+        self.max_history = 30
 
         self._build_ui()
         self._wire_events()
+        self._update_history_buttons()
         self._refresh()
 
     def _build_ui(self):
@@ -657,6 +738,8 @@ class MainWindow(QMainWindow):
         self.btn_import = QPushButton("导入JSON")
         self.btn_import_preview = QPushButton("导入预览")
         self.btn_export = QPushButton("导出JSON")
+        self.btn_undo = QPushButton("撤销")
+        self.btn_redo = QPushButton("重做")
         self.btn_refresh = QPushButton("刷新")
         self.btn_clear = QPushButton("清空")
         self.btn_refresh.setObjectName("GhostButton")
@@ -664,6 +747,8 @@ class MainWindow(QMainWindow):
         self.btn_import.setObjectName("GhostButton")
         self.btn_import_preview.setObjectName("GhostButton")
         self.btn_export.setObjectName("GhostButton")
+        self.btn_undo.setObjectName("GhostButton")
+        self.btn_redo.setObjectName("GhostButton")
 
         btn_grid.addWidget(self.btn_add, 0, 0)
         btn_grid.addWidget(self.btn_update, 0, 1)
@@ -677,6 +762,8 @@ class MainWindow(QMainWindow):
         btn_grid.addWidget(self.btn_export, 2, 1)
         btn_grid.addWidget(self.btn_import_preview, 2, 2)
         btn_grid.addWidget(self.btn_clear, 2, 3)
+        btn_grid.addWidget(self.btn_undo, 3, 0)
+        btn_grid.addWidget(self.btn_redo, 3, 1)
         lay.addLayout(btn_grid)
 
         return card
@@ -740,6 +827,8 @@ class MainWindow(QMainWindow):
         self.btn_import.clicked.connect(self._import_json)
         self.btn_import_preview.clicked.connect(self._preview_import)
         self.btn_export.clicked.connect(self._export_json)
+        self.btn_undo.clicked.connect(self._undo)
+        self.btn_redo.clicked.connect(self._redo)
         self.btn_refresh.clicked.connect(self._refresh)
         self.btn_clear.clicked.connect(self._clear_form)
         self.exit_btn.clicked.connect(self.close)
@@ -781,6 +870,87 @@ class MainWindow(QMainWindow):
 
     def _command_set(self, text: str):
         self.command_edit.setPlainText(text)
+
+    @staticmethod
+    def _history_change_key(hive: int, path: str) -> str:
+        return f"{hive}:{path.lower()}"
+
+    @staticmethod
+    def _item_hive_path(item: MenuItem) -> Tuple[int, str]:
+        return item.hive, f"{item.path}\\{item.key_name}"
+
+    def _capture_change_before(self, change_map: Dict[str, TreeStateChange], hive: int, path: str):
+        key = self._history_change_key(hive, path)
+        if key in change_map:
+            return
+        change_map[key] = TreeStateChange(
+            hive=hive,
+            path=path,
+            before=self.manager.export_tree_if_exists(hive, path),
+            after=None,
+        )
+
+    def _capture_change_after(self, change_map: Dict[str, TreeStateChange], hive: int, path: str):
+        key = self._history_change_key(hive, path)
+        change = change_map.get(key)
+        if not change:
+            change = TreeStateChange(hive=hive, path=path, before=None, after=None)
+            change_map[key] = change
+        change.after = self.manager.export_tree_if_exists(hive, path)
+
+    def _push_history(self, label: str, change_map: Dict[str, TreeStateChange]):
+        changes = [change for change in change_map.values() if change.before != change.after]
+        if not changes:
+            return
+        self.undo_stack.append(HistoryRecord(label=label, changes=changes))
+        if len(self.undo_stack) > self.max_history:
+            self.undo_stack = self.undo_stack[-self.max_history :]
+        self.redo_stack.clear()
+        self._update_history_buttons()
+
+    def _update_history_buttons(self):
+        self.btn_undo.setEnabled(bool(self.undo_stack))
+        self.btn_redo.setEnabled(bool(self.redo_stack))
+
+    def _apply_history_record(self, record: HistoryRecord, undo: bool) -> Tuple[int, int]:
+        success = 0
+        failed = 0
+        changes = sorted(record.changes, key=lambda change: len(change.path), reverse=True)
+        for change in changes:
+            try:
+                target_state = change.before if undo else change.after
+                self.manager.apply_tree_state(change.hive, change.path, target_state)
+                success += 1
+            except Exception:
+                failed += 1
+        self._refresh(set_status=False)
+        return success, failed
+
+    def _undo(self):
+        if not self.undo_stack:
+            self._warn("提示", "没有可撤销的操作。")
+            return
+        record = self.undo_stack.pop()
+        success, failed = self._apply_history_record(record, undo=True)
+        if success > 0:
+            self.redo_stack.append(record)
+        else:
+            self.undo_stack.append(record)
+        self._update_history_buttons()
+        self._set_status(f"撤销 '{record.label}'：成功 {success}，失败 {failed}")
+
+    def _redo(self):
+        if not self.redo_stack:
+            self._warn("提示", "没有可重做的操作。")
+            return
+        record = self.redo_stack.pop()
+        success, failed = self._apply_history_record(record, undo=False)
+        if success > 0:
+            self.undo_stack.append(record)
+        else:
+            self.redo_stack.append(record)
+        self._update_history_buttons()
+        self._set_status(f"重做 '{record.label}'：成功 {success}，失败 {failed}")
 
     @staticmethod
     def _parse_bool(value, default: bool = True) -> bool:
@@ -1242,6 +1412,7 @@ class MainWindow(QMainWindow):
             return
 
         try:
+            change_map: Dict[str, TreeStateChange] = {}
             uid = self.manager.create_shell_item(
                 scope_id=scope_id,
                 display_name=self.name_edit.text().strip(),
@@ -1249,6 +1420,9 @@ class MainWindow(QMainWindow):
                 key_name=self.key_edit.text().strip(),
                 enabled=self.enabled_check.isChecked(),
             )
+            hive, path = self.manager.uid_to_hive_path(uid)
+            self._capture_change_after(change_map, hive, path)
+            self._push_history("新增菜单项", change_map)
             self._refresh(keep_uid=uid, set_status=False)
             self._set_status("新增成功。")
         except PermissionError:
@@ -1270,12 +1444,17 @@ class MainWindow(QMainWindow):
             command = item.command
 
         try:
+            change_map: Dict[str, TreeStateChange] = {}
+            hive, path = self._item_hive_path(item)
+            self._capture_change_before(change_map, hive, path)
             self.manager.update_shell_item(
                 item=item,
                 display_name=self.name_edit.text().strip(),
                 command=command,
                 enabled=self.enabled_check.isChecked(),
             )
+            self._capture_change_after(change_map, hive, path)
+            self._push_history("更新菜单项", change_map)
             self._refresh(keep_uid=item.uid, set_status=False)
             self._set_status("更新成功。")
         except PermissionError:
@@ -1292,7 +1471,12 @@ class MainWindow(QMainWindow):
             self._warn("提示", "请先选择一条 Shell 菜单。")
             return
         try:
+            change_map: Dict[str, TreeStateChange] = {}
+            hive, path = self._item_hive_path(item)
+            self._capture_change_before(change_map, hive, path)
             self.manager.set_enabled(item, not item.enabled)
+            self._capture_change_after(change_map, hive, path)
+            self._push_history("切换启用状态", change_map)
             self._refresh(keep_uid=item.uid, set_status=False)
             self._set_status("状态切换成功。")
         except PermissionError:
@@ -1322,7 +1506,12 @@ class MainWindow(QMainWindow):
         if ok != QMessageBox.Yes:
             return
         try:
+            change_map: Dict[str, TreeStateChange] = {}
+            hive, path = self._item_hive_path(item)
+            self._capture_change_before(change_map, hive, path)
             self.manager.delete_shell_item(item)
+            self._capture_change_after(change_map, hive, path)
+            self._push_history("删除菜单项", change_map)
             self._refresh(set_status=False)
             self._clear_form()
             self._set_status("单条删除成功。")
@@ -1353,13 +1542,20 @@ class MainWindow(QMainWindow):
             return
         deleted = 0
         failed = 0
+        change_map: Dict[str, TreeStateChange] = {}
         for item in candidates:
             try:
+                hive, path = self._item_hive_path(item)
+                self._capture_change_before(change_map, hive, path)
                 self.manager.delete_shell_item(item)
+                self._capture_change_after(change_map, hive, path)
                 deleted += 1
             except Exception:
+                with suppress(Exception):
+                    self._capture_change_after(change_map, hive, path)
                 failed += 1
         try:
+            self._push_history("批量删除菜单项", change_map)
             self._refresh(set_status=False)
             self._clear_form()
             self._set_status(f"批量删除完成：成功 {deleted}，失败 {failed}")
@@ -1376,12 +1572,19 @@ class MainWindow(QMainWindow):
             return
         success = 0
         failed = 0
+        change_map: Dict[str, TreeStateChange] = {}
         for item in targets:
             try:
+                hive, path = self._item_hive_path(item)
+                self._capture_change_before(change_map, hive, path)
                 self.manager.set_enabled(item, enabled)
+                self._capture_change_after(change_map, hive, path)
                 success += 1
             except Exception:
+                with suppress(Exception):
+                    self._capture_change_after(change_map, hive, path)
                 failed += 1
+        self._push_history("批量切换启用状态", change_map)
         self._refresh(set_status=False)
         action = "启用" if enabled else "禁用"
         self._set_status(f"批量{action}完成：成功 {success}，失败 {failed}")
@@ -1465,8 +1668,11 @@ class MainWindow(QMainWindow):
         created_count = 0
         updated_count = 0
         fail_count = 0
+        change_map: Dict[str, TreeStateChange] = {}
         for item in actionable:
             try:
+                hive, path = self.manager.scope_key_to_hive_path(item.scope_id, item.key_name)
+                self._capture_change_before(change_map, hive, path)
                 _uid, created = self.manager.upsert_shell_item(
                     scope_id=item.scope_id,
                     display_name=item.display_name,
@@ -1474,13 +1680,17 @@ class MainWindow(QMainWindow):
                     key_name=item.key_name,
                     enabled=item.enabled,
                 )
+                self._capture_change_after(change_map, hive, path)
                 if created:
                     created_count += 1
                 else:
                     updated_count += 1
             except Exception:
+                with suppress(Exception):
+                    self._capture_change_after(change_map, hive, path)
                 fail_count += 1
 
+        self._push_history("导入 JSON", change_map)
         self._refresh(set_status=False)
         self._set_status(
             f"导入完成：新增 {created_count}，更新 {updated_count}，失败 {fail_count}，"
@@ -1517,11 +1727,42 @@ class MainWindow(QMainWindow):
 def main():
     if sys.platform != "win32":
         raise SystemExit("该程序仅支持 Windows。")
+    if not _ensure_admin():
+        raise SystemExit("需要管理员权限运行。")
     app = QApplication(sys.argv)
     app.setStyleSheet(APP_STYLESHEET)
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
+
+
+def _is_admin() -> bool:
+    with suppress(Exception):
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    return False
+
+
+def _quote_arg(arg: str) -> str:
+    if not arg:
+        return '""'
+    if re.search(r'[\s"]', arg):
+        return f'"{arg.replace(chr(34), chr(92) + chr(34))}"'
+    return arg
+
+
+def _ensure_admin() -> bool:
+    if _is_admin():
+        return True
+
+    exe_path = sys.executable
+    if getattr(sys, "frozen", False):
+        params = " ".join(_quote_arg(arg) for arg in sys.argv[1:])
+    else:
+        script_path = os.path.abspath(__file__)
+        params = " ".join([_quote_arg(script_path)] + [_quote_arg(arg) for arg in sys.argv[1:]])
+
+    ret = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe_path, params, None, 1)
+    return int(ret) > 32
 
 
 if __name__ == "__main__":

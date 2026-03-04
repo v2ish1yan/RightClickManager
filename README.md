@@ -19,6 +19,8 @@
   - 批量启用
   - 批量禁用
   - 批量删除
+- 操作历史
+  - 支持撤销 / 重做（针对可写注册表变更）
 - 导入/导出 JSON 备份
   - 导出自动跳过不可导出的子菜单占位项
   - 导入支持幂等更新（同 key 覆盖更新，不无限重复创建）
@@ -73,7 +75,7 @@ py -3 .\context_menu_manager.py
 
 ```powershell
 py -3 -m pip install pyinstaller
-py -3 -m PyInstaller --noconfirm --clean --onefile --windowed --name "RightClickManager" .\context_menu_manager.py
+py -3 -m PyInstaller --noconfirm --clean --onefile --windowed --uac-admin --name "RightClickManager" .\context_menu_manager.py
 ```
 
 ## 管理范围说明
@@ -128,7 +130,7 @@ py -3 -m PyInstaller --noconfirm --clean --onefile --windowed --name "RightClick
 
 - 读取 HKLM 一般可行，但写入 HKLM 通常需要管理员权限。
 - 删除操作不可撤销，建议先导出 JSON 备份。
-- 本工具不会主动提升权限，请按需用管理员身份运行。
+- 程序默认以管理员权限启动（会触发 UAC 提示）。
 
 ## 常见问题
 
@@ -156,7 +158,7 @@ py -3 -m PyInstaller --noconfirm --clean --onefile --windowed --name "RightClick
 
 ## 路线图
 
-- [ ] 操作历史（撤销/重做）
+- [x] 操作历史（撤销/重做）
 - [x] 导入前差异预览（dry-run）
 - [x] 第三方菜单过滤视图
 - [x] 英文文档（README_EN.md）

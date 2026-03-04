@@ -18,6 +18,8 @@ It helps you scan, filter, sort, edit, and batch-manage common right-click menu 
   - Batch enable
   - Batch disable
   - Batch delete
+- Action history
+  - Supports undo/redo for writable registry changes
 - JSON import/export backup
   - Export skips non-exportable submenu placeholder items
   - Import is idempotent (same key is updated instead of duplicated repeatedly)
@@ -72,7 +74,7 @@ If the old EXE is still running (file locked), the script automatically falls ba
 
 ```powershell
 py -3 -m pip install pyinstaller
-py -3 -m PyInstaller --noconfirm --clean --onefile --windowed --name "RightClickManager" .\context_menu_manager.py
+py -3 -m PyInstaller --noconfirm --clean --onefile --windowed --uac-admin --name "RightClickManager" .\context_menu_manager.py
 ```
 
 ## Managed Registry Scope
@@ -127,7 +129,7 @@ Field descriptions:
 
 - Reading HKLM is usually allowed, but writing HKLM typically requires Administrator privileges.
 - Delete is irreversible; export a JSON backup first.
-- This app does not self-elevate privileges. Run as Administrator when needed.
+- The app now defaults to Administrator launch (UAC prompt expected).
 
 ## FAQ
 
@@ -156,7 +158,7 @@ Field descriptions:
 
 ## Roadmap
 
-- [ ] Action history (undo/redo)
+- [x] Action history (undo/redo)
 - [x] Import diff preview (dry-run)
 - [x] Third-party menu filtering view
 

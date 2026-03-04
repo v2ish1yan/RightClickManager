@@ -34,6 +34,7 @@ py -3 -m PyInstaller `
     --clean `
     --onefile `
     --windowed `
+    --uac-admin `
     --name "$targetName" `
     .\context_menu_manager.py
 
