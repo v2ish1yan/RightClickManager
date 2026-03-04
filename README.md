@@ -2,6 +2,8 @@
 
 一个面向 Windows 的右键菜单管理器（PySide6 桌面应用），支持扫描、筛选、排序、编辑与批量管理常见右键菜单项。
 
+[English Documentation](./README_EN.md)
+
 ## 功能特性
 
 - 全量扫描常见位置（`HKCU` / `HKLM`）
@@ -154,7 +156,7 @@ py -3 -m PyInstaller --noconfirm --clean --onefile --windowed --name "RightClick
 - [ ] 操作历史（撤销/重做）
 - [ ] 导入前差异预览（dry-run）
 - [ ] 第三方菜单过滤视图
-- [ ] 英文文档（README_EN.md）
+- [x] 英文文档（README_EN.md）
 
 ## License
 
