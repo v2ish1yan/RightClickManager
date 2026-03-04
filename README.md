@@ -22,6 +22,9 @@
 - 导入/导出 JSON 备份
   - 导出自动跳过不可导出的子菜单占位项
   - 导入支持幂等更新（同 key 覆盖更新，不无限重复创建）
+  - 支持导入前差异预览（dry-run）
+- 第三方菜单过滤视图
+  - 支持“仅第三方 / 仅系统项”切换
 - 现代化圆角 UI
   - 卡片布局
   - 高对比头部
@@ -154,8 +157,8 @@ py -3 -m PyInstaller --noconfirm --clean --onefile --windowed --name "RightClick
 ## 路线图
 
 - [ ] 操作历史（撤销/重做）
-- [ ] 导入前差异预览（dry-run）
-- [ ] 第三方菜单过滤视图
+- [x] 导入前差异预览（dry-run）
+- [x] 第三方菜单过滤视图
 - [x] 英文文档（README_EN.md）
 
 ## License

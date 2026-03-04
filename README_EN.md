@@ -21,6 +21,9 @@ It helps you scan, filter, sort, edit, and batch-manage common right-click menu 
 - JSON import/export backup
   - Export skips non-exportable submenu placeholder items
   - Import is idempotent (same key is updated instead of duplicated repeatedly)
+  - Supports import diff preview (dry-run) before applying changes
+- Third-party menu filtering view
+  - Switch between `All / Third-Party Only / System Only`
 - Modern rounded UI
   - Card-style layout
   - High-contrast header
@@ -154,8 +157,8 @@ Field descriptions:
 ## Roadmap
 
 - [ ] Action history (undo/redo)
-- [ ] Import diff preview (dry-run)
-- [ ] Third-party menu filtering view
+- [x] Import diff preview (dry-run)
+- [x] Third-party menu filtering view
 
 ## License
 

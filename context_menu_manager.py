@@ -1,6 +1,7 @@
 import re
 import sys
 import json
+import os
 import threading
 from contextlib import suppress
 from dataclasses import dataclass
@@ -59,6 +60,18 @@ class MenuItem:
     command: str
     enabled: bool
     has_submenu: bool
+
+
+@dataclass
+class ImportPlanItem:
+    line_no: int
+    scope_id: str
+    key_name: str
+    display_name: str
+    command: str
+    enabled: bool
+    action: str  # create | update | unchanged | blocked | skip
+    reason: str = ""
 
 
 def build_scopes() -> List[Scope]:
@@ -361,6 +374,15 @@ class RegistryManager:
                 return True
         return False
 
+    def can_write_scope(self, scope_id: str) -> bool:
+        scope = self.scope_map.get(scope_id)
+        if not scope or scope.kind != "shell":
+            return False
+        with suppress(OSError):
+            with winreg.OpenKey(scope.hive, scope.path, 0, winreg.KEY_CREATE_SUB_KEY):
+                return True
+        return False
+
 
 APP_STYLESHEET = """
 QWidget {
@@ -485,6 +507,7 @@ class MainWindow(QMainWindow):
         self.refresh_emitter.completed.connect(self._on_refresh_completed)
         self.refresh_inflight = False
         self.pending_refresh: Optional[Tuple[str, bool]] = None
+        self.third_party_cache: Dict[str, bool] = {}
 
         self._build_ui()
         self._wire_events()
@@ -582,6 +605,9 @@ class MainWindow(QMainWindow):
         self.kind_combo = QComboBox()
         self.kind_combo.addItems(["全部", "Shell", "Handler"])
 
+        self.third_party_combo = QComboBox()
+        self.third_party_combo.addItems(["全部", "仅第三方", "仅系统项"])
+
         self.scope_combo = QComboBox()
         self.scope_combo.addItems(self.scope_labels)
 
@@ -603,6 +629,7 @@ class MainWindow(QMainWindow):
             ("来源", self.hive_combo),
             ("类型", self.category_combo),
             ("条目", self.kind_combo),
+            ("视图", self.third_party_combo),
             ("新增位置", self.scope_combo),
             ("显示名称", self.name_edit),
             ("键名", self.key_edit),
@@ -628,12 +655,14 @@ class MainWindow(QMainWindow):
         self.btn_delete = QPushButton("删除(单条)")
         self.btn_batch_delete = QPushButton("批量删除")
         self.btn_import = QPushButton("导入JSON")
+        self.btn_import_preview = QPushButton("导入预览")
         self.btn_export = QPushButton("导出JSON")
         self.btn_refresh = QPushButton("刷新")
         self.btn_clear = QPushButton("清空")
         self.btn_refresh.setObjectName("GhostButton")
         self.btn_clear.setObjectName("GhostButton")
         self.btn_import.setObjectName("GhostButton")
+        self.btn_import_preview.setObjectName("GhostButton")
         self.btn_export.setObjectName("GhostButton")
 
         btn_grid.addWidget(self.btn_add, 0, 0)
@@ -646,7 +675,8 @@ class MainWindow(QMainWindow):
         btn_grid.addWidget(self.btn_refresh, 1, 3)
         btn_grid.addWidget(self.btn_import, 2, 0)
         btn_grid.addWidget(self.btn_export, 2, 1)
-        btn_grid.addWidget(self.btn_clear, 2, 2, 1, 2)
+        btn_grid.addWidget(self.btn_import_preview, 2, 2)
+        btn_grid.addWidget(self.btn_clear, 2, 3)
         lay.addLayout(btn_grid)
 
         return card
@@ -694,6 +724,7 @@ class MainWindow(QMainWindow):
         self.hive_combo.currentIndexChanged.connect(lambda _i: self._apply_filter())
         self.category_combo.currentIndexChanged.connect(lambda _i: self._apply_filter())
         self.kind_combo.currentIndexChanged.connect(lambda _i: self._apply_filter())
+        self.third_party_combo.currentIndexChanged.connect(lambda _i: self._apply_filter())
         self.filter_timer.timeout.connect(self._on_filter_timeout)
 
         self.table.itemSelectionChanged.connect(self._on_select)
@@ -707,6 +738,7 @@ class MainWindow(QMainWindow):
         self.btn_delete.clicked.connect(self._delete_single_item)
         self.btn_batch_delete.clicked.connect(self._delete_batch_items)
         self.btn_import.clicked.connect(self._import_json)
+        self.btn_import_preview.clicked.connect(self._preview_import)
         self.btn_export.clicked.connect(self._export_json)
         self.btn_refresh.clicked.connect(self._refresh)
         self.btn_clear.clicked.connect(self._clear_form)
@@ -749,6 +781,228 @@ class MainWindow(QMainWindow):
 
     def _command_set(self, text: str):
         self.command_edit.setPlainText(text)
+
+    @staticmethod
+    def _parse_bool(value, default: bool = True) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            text = value.strip().lower()
+            if text in {"1", "true", "yes", "y", "on"}:
+                return True
+            if text in {"0", "false", "no", "n", "off"}:
+                return False
+        return default
+
+    @staticmethod
+    def _extract_exec_token(command: str) -> str:
+        text = command.strip()
+        if not text:
+            return ""
+        if text.startswith('"'):
+            end = text.find('"', 1)
+            if end > 1:
+                return text[1:end].strip()
+        parts = text.split(None, 1)
+        return parts[0].strip() if parts else ""
+
+    def _is_system_command(self, command: str) -> bool:
+        text = command.strip()
+        if not text:
+            return False
+
+        text_lower = text.lower()
+        if "%windir%" in text_lower or "%systemroot%" in text_lower:
+            return True
+
+        token = self._extract_exec_token(text)
+        if not token:
+            return False
+
+        token = token.strip().strip('"').replace("/", "\\")
+        token_lower = token.lower()
+        basename = os.path.basename(token_lower)
+        builtin_names = {
+            "cmd.exe",
+            "powershell.exe",
+            "pwsh.exe",
+            "wscript.exe",
+            "cscript.exe",
+            "rundll32.exe",
+            "regsvr32.exe",
+            "msiexec.exe",
+            "explorer.exe",
+            "notepad.exe",
+            "control.exe",
+            "mshta.exe",
+        }
+        if basename in builtin_names:
+            return True
+
+        expanded = os.path.expandvars(token).replace("/", "\\").rstrip("\\")
+        expanded_lower = expanded.lower()
+        windows_dir = os.environ.get("WINDIR", r"C:\Windows").replace("/", "\\").rstrip("\\").lower()
+        return expanded_lower == windows_dir or expanded_lower.startswith(f"{windows_dir}\\")
+
+    def _is_third_party_item(self, item: MenuItem) -> bool:
+        cached = self.third_party_cache.get(item.uid)
+        if cached is not None:
+            return cached
+
+        if item.kind == "shell":
+            command = item.command.strip()
+            result = bool(command) and command != SUBMENU_PLACEHOLDER and not self._is_system_command(command)
+        else:
+            text = f"{item.display_name} {item.key_name} {item.command}".lower()
+            system_markers = ("microsoft", "windows", "system", "explorer", "shell")
+            result = not any(marker in text for marker in system_markers)
+
+        self.third_party_cache[item.uid] = result
+        return result
+
+    def _load_import_entries(self, path: str) -> Optional[List]:
+        try:
+            with open(path, "r", encoding="utf-8") as fp:
+                data = json.load(fp)
+        except Exception as exc:
+            self._error("导入失败", f"读取 JSON 失败：{exc}")
+            return None
+
+        if isinstance(data, dict):
+            entries = data.get("items", [])
+        elif isinstance(data, list):
+            entries = data
+        else:
+            self._error("导入失败", "JSON 格式无效，需为对象或数组。")
+            return None
+
+        if not isinstance(entries, list) or not entries:
+            self._warn("提示", "JSON 中没有可导入条目。")
+            return None
+
+        return entries
+
+    def _build_import_plan(self, entries: List) -> Tuple[List[ImportPlanItem], Dict[str, int]]:
+        current_shell_items = {item.uid: item for item in self.manager.list_items() if item.kind == "shell"}
+        scope_write_cache: Dict[str, bool] = {}
+        plan: List[ImportPlanItem] = []
+        counts = {"total": len(entries), "create": 0, "update": 0, "unchanged": 0, "blocked": 0, "skip": 0}
+
+        for idx, entry in enumerate(entries, 1):
+            if not isinstance(entry, dict):
+                plan.append(ImportPlanItem(idx, "", "", "", "", True, "skip", "条目不是对象"))
+                counts["skip"] += 1
+                continue
+
+            scope_id = str(entry.get("scope_id", "")).strip()
+            scope = self.manager.scope_map.get(scope_id)
+            if not scope or scope.kind != "shell":
+                plan.append(ImportPlanItem(idx, scope_id, "", "", "", True, "skip", "scope_id 无效或非 Shell"))
+                counts["skip"] += 1
+                continue
+
+            display_name = str(entry.get("display_name", "")).strip()
+            command = str(entry.get("command", "")).strip()
+            enabled = self._parse_bool(entry.get("enabled", True), True)
+            has_submenu = self._parse_bool(entry.get("has_submenu", False), False)
+            raw_key_name = str(entry.get("key_name", "")).strip()
+            key_name = self.manager._slugify(raw_key_name or display_name)
+
+            if has_submenu or (not display_name) or (not command) or command == SUBMENU_PLACEHOLDER:
+                plan.append(ImportPlanItem(idx, scope_id, key_name, display_name, command, enabled, "skip", "缺少有效字段或子菜单占位项"))
+                counts["skip"] += 1
+                continue
+
+            uid = f"{scope_id}|{key_name}"
+            existing = current_shell_items.get(uid)
+            if existing:
+                changed = (
+                    existing.display_name != display_name
+                    or existing.command != command
+                    or existing.enabled != enabled
+                )
+                if not changed:
+                    plan.append(ImportPlanItem(idx, scope_id, key_name, display_name, command, enabled, "unchanged", "与现有内容一致"))
+                    counts["unchanged"] += 1
+                    continue
+                if not self.manager.can_write(existing):
+                    plan.append(ImportPlanItem(idx, scope_id, key_name, display_name, command, enabled, "blocked", "目标项不可写"))
+                    counts["blocked"] += 1
+                    continue
+                plan.append(ImportPlanItem(idx, scope_id, key_name, display_name, command, enabled, "update", "将更新现有项"))
+                counts["update"] += 1
+                current_shell_items[uid] = MenuItem(
+                    uid=uid,
+                    scope_id=existing.scope_id,
+                    hive=existing.hive,
+                    hive_name=existing.hive_name,
+                    path=existing.path,
+                    category=existing.category,
+                    kind="shell",
+                    key_name=existing.key_name,
+                    display_name=display_name,
+                    command=command,
+                    enabled=enabled,
+                    has_submenu=False,
+                )
+                continue
+
+            can_write_scope = scope_write_cache.get(scope_id)
+            if can_write_scope is None:
+                can_write_scope = self.manager.can_write_scope(scope_id)
+                scope_write_cache[scope_id] = can_write_scope
+            if not can_write_scope:
+                plan.append(ImportPlanItem(idx, scope_id, key_name, display_name, command, enabled, "blocked", "目标位置不可写"))
+                counts["blocked"] += 1
+                continue
+
+            plan.append(ImportPlanItem(idx, scope_id, key_name, display_name, command, enabled, "create", "将新增"))
+            counts["create"] += 1
+            current_shell_items[uid] = MenuItem(
+                uid=uid,
+                scope_id=scope_id,
+                hive=scope.hive,
+                hive_name=scope.hive_name,
+                path=scope.path,
+                category=scope.category,
+                kind="shell",
+                key_name=key_name,
+                display_name=display_name,
+                command=command,
+                enabled=enabled,
+                has_submenu=False,
+            )
+
+        return plan, counts
+
+    @staticmethod
+    def _format_import_preview(path: str, plan: List[ImportPlanItem], counts: Dict[str, int]) -> str:
+        header = [
+            f"文件: {path}",
+            f"总计: {counts['total']}",
+            f"新增: {counts['create']}  更新: {counts['update']}  不变: {counts['unchanged']}",
+            f"不可写: {counts['blocked']}  跳过: {counts['skip']}",
+            "",
+            "明细（最多展示前 120 条）:",
+        ]
+        action_label = {
+            "create": "[新增]",
+            "update": "[更新]",
+            "unchanged": "[不变]",
+            "blocked": "[不可写]",
+            "skip": "[跳过]",
+        }
+        lines: List[str] = []
+        for item in plan[:120]:
+            label = action_label.get(item.action, "[未知]")
+            scope_key = f"{item.scope_id}|{item.key_name}" if item.scope_id else "-"
+            name = item.display_name or "(无显示名)"
+            lines.append(f"{label} #{item.line_no} {scope_key} {name} - {item.reason}")
+        if len(plan) > 120:
+            lines.append(f"... 其余 {len(plan) - 120} 条未展示")
+        return "\n".join(header + lines)
 
     def _set_action_state(self, single_editable: bool, batch_editable: bool):
         self.btn_update.setEnabled(single_editable)
@@ -793,6 +1047,7 @@ class MainWindow(QMainWindow):
             rows = rows_obj if isinstance(rows_obj, list) else []
             self.items = rows
             self.item_map = {item.uid: item for item in self.items}
+            self.third_party_cache.clear()
             self._apply_filter(keep_uid)
             if set_status:
                 self._set_status(f"已加载 {len(self.items)} 条菜单项")
@@ -809,6 +1064,7 @@ class MainWindow(QMainWindow):
         hive_filter = self.hive_combo.currentText()
         category_filter = self.category_combo.currentText()
         kind_filter = self.kind_combo.currentText().lower()
+        third_party_filter = self.third_party_combo.currentText()
 
         rows = self.items
         if hive_filter != "全部":
@@ -819,6 +1075,10 @@ class MainWindow(QMainWindow):
             rows = [item for item in rows if item.kind == "shell"]
         elif kind_filter == "handler":
             rows = [item for item in rows if item.kind == "handler"]
+        if third_party_filter == "仅第三方":
+            rows = [item for item in rows if self._is_third_party_item(item)]
+        elif third_party_filter == "仅系统项":
+            rows = [item for item in rows if not self._is_third_party_item(item)]
         if keyword:
             rows = [
                 item
@@ -1171,54 +1431,48 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "导入 JSON", "", "JSON Files (*.json)")
         if not path:
             return
+        entries = self._load_import_entries(path)
+        if entries is None:
+            return
+
         try:
-            with open(path, "r", encoding="utf-8") as fp:
-                data = json.load(fp)
+            plan, counts = self._build_import_plan(entries)
         except Exception as exc:
-            self._error("导入失败", f"读取 JSON 失败：{exc}")
+            self._error("导入失败", f"预扫描失败：{exc}")
             return
 
-        if isinstance(data, dict):
-            entries = data.get("items", [])
-        elif isinstance(data, list):
-            entries = data
-        else:
-            self._error("导入失败", "JSON 格式无效，需为对象或数组。")
+        actionable = [item for item in plan if item.action in {"create", "update"}]
+        if not actionable:
+            self._warn("提示", "没有可导入变更（可能全部相同、不可写或无效）。")
+            self._set_status(
+                f"导入跳过：不变 {counts['unchanged']}，不可写 {counts['blocked']}，跳过 {counts['skip']}"
+            )
             return
 
-        if not isinstance(entries, list) or not entries:
-            self._warn("提示", "JSON 中没有可导入条目。")
+        ok = QMessageBox.question(
+            self,
+            "确认导入",
+            (
+                f"预览结果：新增 {counts['create']}，更新 {counts['update']}，不变 {counts['unchanged']}，"
+                f"不可写 {counts['blocked']}，跳过 {counts['skip']}。\n\n确认执行导入吗？"
+            ),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if ok != QMessageBox.Yes:
             return
 
         created_count = 0
         updated_count = 0
         fail_count = 0
-        skip_count = 0
-
-        for entry in entries:
-            if not isinstance(entry, dict):
-                skip_count += 1
-                continue
-            scope_id = str(entry.get("scope_id", "")).strip()
-            scope = self.manager.scope_map.get(scope_id)
-            if not scope or scope.kind != "shell":
-                skip_count += 1
-                continue
-            display_name = str(entry.get("display_name", "")).strip()
-            command = str(entry.get("command", "")).strip()
-            key_name = str(entry.get("key_name", "")).strip()
-            enabled = bool(entry.get("enabled", True))
-            has_submenu = bool(entry.get("has_submenu", False))
-            if has_submenu or (not display_name) or (not command) or command == SUBMENU_PLACEHOLDER:
-                skip_count += 1
-                continue
+        for item in actionable:
             try:
                 _uid, created = self.manager.upsert_shell_item(
-                    scope_id=scope_id,
-                    display_name=display_name,
-                    command=command,
-                    key_name=key_name,
-                    enabled=enabled,
+                    scope_id=item.scope_id,
+                    display_name=item.display_name,
+                    command=item.command,
+                    key_name=item.key_name,
+                    enabled=item.enabled,
                 )
                 if created:
                     created_count += 1
@@ -1229,7 +1483,28 @@ class MainWindow(QMainWindow):
 
         self._refresh(set_status=False)
         self._set_status(
-            f"导入完成：新增 {created_count}，更新 {updated_count}，失败 {fail_count}，跳过 {skip_count}"
+            f"导入完成：新增 {created_count}，更新 {updated_count}，失败 {fail_count}，"
+            f"不变 {counts['unchanged']}，不可写 {counts['blocked']}，跳过 {counts['skip']}"
+        )
+
+    def _preview_import(self):
+        path, _ = QFileDialog.getOpenFileName(self, "导入预览 (dry-run)", "", "JSON Files (*.json)")
+        if not path:
+            return
+        entries = self._load_import_entries(path)
+        if entries is None:
+            return
+        try:
+            plan, counts = self._build_import_plan(entries)
+        except Exception as exc:
+            self._error("预览失败", f"预扫描失败：{exc}")
+            return
+
+        text = self._format_import_preview(path, plan, counts)
+        QMessageBox.information(self, "导入预览 (dry-run)", text)
+        self._set_status(
+            f"预览完成：新增 {counts['create']}，更新 {counts['update']}，不变 {counts['unchanged']}，"
+            f"不可写 {counts['blocked']}，跳过 {counts['skip']}"
         )
 
     def _error(self, title: str, text: str):
